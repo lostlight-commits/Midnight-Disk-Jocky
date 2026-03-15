@@ -1,0 +1,36 @@
+{
+  "name": "discord-music-bot",
+  "version": "2.0.0",
+  "description": "Discord music bot with YouTube, Spotify, TuneIn, and iHeartRadio support",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "keywords": [
+    "discord",
+    "music",
+    "bot"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.0",
+    "@snazzah/davey": "^0.1.9",
+    "discord.js": "^14.25.1",
+    "ffmpeg-static": "^5.3.0",
+    "libsodium-wrappers": "^0.8.2",
+    "opusscript": "^0.1.1",
+    "sodium-native": "^5.0.10",
+    "spotify-web-api-node": "^5.0.2",
+    "tweetnacl": "^1.0.3",
+    "youtube-dl-exec": "^3.0.30",
+    "yt-search": "^2.13.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "eslint": "^10.0.3"
+  }
+}
