@@ -11,6 +11,8 @@ const execPromise = promisify(exec);
 // Resolve config path relative to this file so systemd/cwd do not matter
 const configPath = path.join(__dirname, 'config.json');
 const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+// Optional bot owner ID (Discord user ID) used for owner-only commands
+const OWNER_ID = config.owner_id || '290553401815597057';
 // Path to yt-dlp binary; can be overridden in config.json with "ytdlp_path"
 const YTDLP_BIN = config.ytdlp_path || 'yt-dlp';
 // Extra yt-dlp args (for example: ["--cookies", "/path/to/cookies.txt"]).
@@ -1497,8 +1499,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName } = interaction;
 
     if (commandName === 'resetcommans') {
-        const ownerId = '290553401815597057';
-        if (interaction.user.id !== ownerId) {
+        if (interaction.user.id !== OWNER_ID) {
             return interaction.reply({
                 content: '❌ You are not allowed to use this command.',
                 flags: MessageFlags.Ephemeral
