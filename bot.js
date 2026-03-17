@@ -100,6 +100,19 @@ const RADIO_PAGE_SIZE = 25;
 // Per-user radio browsing sessions (stores last fetched station list)
 const radioSessions = new Map();
 
+// Periodic safety check to ensure we eventually leave empty voice channels
+// even if a voiceStateUpdate event is missed for some reason.
+setInterval(() => {
+	for (const [guildId, queue] of queues.entries()) {
+		if (!queue || !queue.connection) continue;
+		try {
+			queue.checkIdleState();
+		} catch (err) {
+			console.error('Periodic idle check failed for guild', guildId, '-', err.message || err);
+		}
+	}
+}, 60 * 1000); // every 60 seconds
+
 class MusicQueue {
     constructor(guildId) {
         this.guildId = guildId;
@@ -114,13 +127,29 @@ class MusicQueue {
         this.restartInterval = null;
         this.currentProcess = null; // Active ffmpeg / yt-dlp child process
         this.connectionListenersAttached = false;
+		this.manualStop = false; // True when user intentionally stopped/skipped
+		this.history = []; // Previously played tracks for "previous" support
 
-        this.player.on(AudioPlayerStatus.Idle, () => {
-            if (this.loop && this.currentSong) {
-                this.songs.unshift(this.currentSong);
-            }
-            this.playNext();
-        });
+		this.player.on(AudioPlayerStatus.Idle, () => {
+			// If this Idle was triggered by a manual stop/skip, do not auto-restart
+			// the same radio station; just advance the queue.
+			if (this.manualStop) {
+				this.manualStop = false;
+				this.playNext();
+				return;
+			}
+
+			// For radio, always requeue the current station so it restarts if the
+			// remote stream drops or ends unexpectedly.
+			if (this.currentSong && this.currentSong.type === 'radio') {
+				this.songs.unshift(this.currentSong);
+			} else if (this.loop && this.currentSong) {
+				// For normal tracks, only loop when explicitly enabled.
+				this.songs.unshift(this.currentSong);
+			}
+
+			this.playNext();
+		});
 
         this.player.on('error', (error) => {
             console.error('Audio error:', error.message);
@@ -259,7 +288,18 @@ class MusicQueue {
             return;
         }
 
+		// Track history so we can support a simple "previous" button.
+		if (this.currentSong) {
+			this.history.push(this.currentSong);
+			if (this.history.length > 50) {
+				this.history.shift();
+			}
+		}
+
         this.currentSong = this.songs.shift();
+		// Starting a new track, so any previous manualStop flag should not
+		// affect how we handle the next Idle event.
+		this.manualStop = false;
         this.isPlaying = true;
         this.clearIdleTimeout(); // Playing content, clear idle
 
@@ -397,9 +437,34 @@ class MusicQueue {
     }
 
     skip() {
+		this.manualStop = true;
         this.stopCurrentProcess();
         this.player.stop();
     }
+
+	// Attempt to play the previously played track, if available. Returns
+	// true when a previous track was queued, false otherwise.
+	async playPrevious() {
+		if (!this.history || this.history.length === 0) {
+			return false;
+		}
+
+		const previous = this.history.pop();
+
+		// Put the current song back at the front of the queue so it can be
+		// played again later if desired.
+		if (this.currentSong) {
+			this.songs.unshift(this.currentSong);
+		}
+
+		// Queue the previous track to be played next.
+		this.songs.unshift(previous);
+
+		this.manualStop = true;
+		this.stopCurrentProcess();
+		this.player.stop();
+		return true;
+	}
 
     pause() {
         return this.player.pause();
@@ -412,6 +477,7 @@ class MusicQueue {
     stop() {
         this.songs = [];
         this.currentSong = null;
+		this.manualStop = true;
         this.stopCurrentProcess();
         this.player.stop();
         this.isPlaying = false;
@@ -480,6 +546,33 @@ async function ensureSpotifyAccessToken() {
         console.error('Spotify token fetch failed:', err.message || err);
         return null;
     }
+}
+
+// Build a normalized key for matching playlist favorites across different
+// URL forms (e.g., Spotify web URLs vs spotify: URIs, YouTube URLs with
+// varying query strings). This is only used for identifying favorites,
+// not for actual playback.
+function normalizePlaylistKey(url) {
+	if (!url || typeof url !== 'string') return null;
+
+	// Spotify playlists: normalize to spotify:<id>
+	const spotifyInfo = parseSpotifyUrl(url);
+	if (spotifyInfo && spotifyInfo.type === 'playlist') {
+		return `spotify:${spotifyInfo.id}`;
+	}
+
+	// YouTube playlists: normalize based on the list= parameter
+	try {
+		const u = new URL(url);
+		const list = u.searchParams.get('list');
+		if (list) {
+			return `yt:${list}`;
+		}
+	} catch {
+		// Not a valid URL; fall through and use trimmed string
+	}
+
+	return url.trim();
 }
 
 function parseSpotifyUrl(url) {
@@ -611,7 +704,8 @@ async function resolvePlaylistNameFromUrl(url) {
         console.error('Spotify playlist name resolve failed:', err.message || err);
     }
 
-    // Fallback: use yt-dlp to inspect the playlist
+    // Fallback: use yt-dlp to inspect the playlist. This can be slow, so we
+    // run it with a timeout to avoid hanging the whole command.
     try {
         const playlistArgs = [
             '--flat-playlist',
@@ -620,7 +714,7 @@ async function resolvePlaylistNameFromUrl(url) {
         ];
         const allArgs = [...YTDLP_ARGS, ...playlistArgs];
         const cmd = `${YTDLP_BIN} ${allArgs.map(a => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')}`;
-        const { stdout } = await execPromise(cmd);
+        const { stdout } = await execPromise(cmd, { timeout: 15000 });
         const firstLine = stdout
             .trim()
             .split('\n')
@@ -996,6 +1090,20 @@ const commands = [
         .setDescription('Play one of your saved favorites'),
 
     new SlashCommandBuilder()
+        .setName('clearfavorites')
+        .setDescription('Clear your saved favorites')
+        .addStringOption(option =>
+            option.setName('type')
+                .setDescription('Which favorites to clear')
+                .setRequired(true)
+                .addChoices(
+                    { name: 'Playlists', value: 'playlists' },
+                    { name: 'Radio Stations', value: 'radios' },
+                    { name: 'All', value: 'all' }
+                )
+        ),
+
+    new SlashCommandBuilder()
         .setName('prefrence')
         .setDescription('View or change your playback preferences and favorites')
         .addBooleanOption(option =>
@@ -1015,7 +1123,15 @@ const commands = [
         .addStringOption(option =>
             option.setName('favorite')
                 .setDescription('Playlist URL or "radio" to save current station')
-                .setRequired(false)),
+                .setRequired(false))
+        .addStringOption(option =>
+            option.setName('favorite_name')
+                .setDescription('Custom name for a playlist favorite (rename or set)')
+				.setRequired(false))
+		.addBooleanOption(option =>
+			option.setName('favorite_delete')
+				.setDescription('Delete the matching playlist favorite')
+				.setRequired(false)),
 
     new SlashCommandBuilder()
         .setName('resetcommans')
@@ -1493,6 +1609,65 @@ client.on('interactionCreate', async interaction => {
             });
             return;
         }
+
+		// Playback control buttons from the /nowplaying embed
+		if (interaction.customId.startsWith('np_')) {
+			const queue = queues.get(guildId);
+			if (!queue || !queue.currentSong) {
+				await interaction.reply({ content: '❌ Nothing is playing!', flags: MessageFlags.Ephemeral });
+				return;
+			}
+
+			if (interaction.customId === 'np_skip') {
+				queue.skip();
+				await interaction.reply({ content: '⏭️ Skipped!', flags: MessageFlags.Ephemeral });
+				return;
+			}
+
+			if (interaction.customId === 'np_prev') {
+				const ok = await queue.playPrevious();
+				if (!ok) {
+					await interaction.reply({ content: '❌ No previous track to play.', flags: MessageFlags.Ephemeral });
+				} else {
+					await interaction.reply({ content: '⏮️ Playing previous track.', flags: MessageFlags.Ephemeral });
+				}
+				return;
+			}
+
+			if (interaction.customId === 'np_pause') {
+				queue.pause();
+				await interaction.reply({ content: '⏸️ Paused!', flags: MessageFlags.Ephemeral });
+				return;
+			}
+
+			if (interaction.customId === 'np_play') {
+				queue.resume();
+				await interaction.reply({ content: '▶️ Resumed!', flags: MessageFlags.Ephemeral });
+				return;
+			}
+
+			if (interaction.customId === 'np_loop') {
+				queue.loop = !queue.loop;
+				const prefs = getUserPreferences(interaction.user.id);
+				prefs.loop = queue.loop;
+				saveUserPreferences();
+				await interaction.reply({ content: `🔁 Loop: **${queue.loop ? 'ON' : 'OFF'}** (Preference saved)`, flags: MessageFlags.Ephemeral });
+				return;
+			}
+
+			if (interaction.customId === 'np_shuffle') {
+				if (!queue.songs || queue.songs.length === 0) {
+					await interaction.reply({ content: '❌ Queue is empty!', flags: MessageFlags.Ephemeral });
+				} else {
+					queue.shuffle();
+					const prefs = getUserPreferences(interaction.user.id);
+					prefs.shuffle = true;
+					saveUserPreferences();
+					await interaction.reply({ content: '🔀 Queue shuffled! (Preference saved)', flags: MessageFlags.Ephemeral });
+				}
+				return;
+			}
+		}
     }
 
     // Handle slash commands
@@ -1697,7 +1872,39 @@ client.on('interactionCreate', async interaction => {
                 { name: 'Loop', value: queue.loop ? '✅ On' : '❌ Off', inline: true }
             );
 
-        await interaction.reply({ embeds: [embed] });
+		// Attach playback control buttons so users can manage playback
+		// directly from the nowplaying message.
+		const controlsRow1 = new ActionRowBuilder().addComponents(
+			new ButtonBuilder()
+				.setCustomId('np_prev')
+				.setLabel('Previous')
+				.setStyle(ButtonStyle.Secondary),
+			new ButtonBuilder()
+				.setCustomId('np_pause')
+				.setLabel('Pause')
+				.setStyle(ButtonStyle.Secondary),
+			new ButtonBuilder()
+				.setCustomId('np_play')
+				.setLabel('Play')
+				.setStyle(ButtonStyle.Secondary),
+			new ButtonBuilder()
+				.setCustomId('np_skip')
+				.setLabel('Skip')
+				.setStyle(ButtonStyle.Primary)
+		);
+
+		const controlsRow2 = new ActionRowBuilder().addComponents(
+			new ButtonBuilder()
+				.setCustomId('np_loop')
+				.setLabel('Loop')
+				.setStyle(ButtonStyle.Secondary),
+			new ButtonBuilder()
+				.setCustomId('np_shuffle')
+				.setLabel('Shuffle')
+				.setStyle(ButtonStyle.Secondary)
+		);
+
+        await interaction.reply({ embeds: [embed], components: [controlsRow1, controlsRow2] });
     }
 
     if (commandName === 'loop') {
@@ -1774,134 +1981,225 @@ client.on('interactionCreate', async interaction => {
         return;
     }
 
+    if (commandName === 'clearfavorites') {
+        const prefs = getUserPreferences(interaction.user.id);
+        const type = interaction.options.getString('type');
+
+        let clearedPlaylists = 0;
+        let clearedRadios = 0;
+
+        if (type === 'playlists' || type === 'all') {
+            if (Array.isArray(prefs.favoritePlaylists)) {
+                clearedPlaylists = prefs.favoritePlaylists.length;
+                prefs.favoritePlaylists = [];
+            }
+        }
+
+        if (type === 'radios' || type === 'all') {
+            if (Array.isArray(prefs.favoriteRadios)) {
+                clearedRadios = prefs.favoriteRadios.length;
+                prefs.favoriteRadios = [];
+            }
+        }
+
+        saveUserPreferences();
+
+        if (clearedPlaylists === 0 && clearedRadios === 0) {
+            return interaction.reply({
+                content: 'ℹ️ You have no favorites of that type to clear.',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        const parts = [];
+        if (clearedPlaylists > 0) parts.push(`${clearedPlaylists} playlist${clearedPlaylists !== 1 ? 's' : ''}`);
+        if (clearedRadios > 0) parts.push(`${clearedRadios} radio station${clearedRadios !== 1 ? 's' : ''}`);
+
+        return interaction.reply({
+            content: `🗑️ Cleared ${parts.join(' and ')} from your favorites.`,
+            flags: MessageFlags.Ephemeral
+        });
+    }
+
     if (commandName === 'preference' || commandName === 'prefrence') {
-        const userId = interaction.user.id;
-        const shuffle = interaction.options.getBoolean('shuffle');
-        const loop = interaction.options.getBoolean('loop');
-        const volume = interaction.options.getInteger('volume');
-        const favorite = interaction.options.getString('favorite');
+        try {
+            const userId = interaction.user.id;
 
-        const prefs = getUserPreferences(userId);
-        let changed = false;
+            // Defer reply so we never hit the 3-second timeout, but keep the
+            // command itself fast and mostly synchronous.
+            await interaction.deferReply({ ephemeral: true });
 
-        // Handle favorites: playlist URLs or "radio" keyword
-        if (favorite) {
-            const favLower = favorite.toLowerCase();
+            const shuffle = interaction.options.getBoolean('shuffle');
+            const loop = interaction.options.getBoolean('loop');
+            const volume = interaction.options.getInteger('volume');
+            const favorite = interaction.options.getString('favorite');
+            const favoriteName = interaction.options.getString('favorite_name');
+            const favoriteDelete = interaction.options.getBoolean('favorite_delete');
 
-            if (favLower === 'radio') {
-                const queue = queues.get(guildId);
-                if (!queue || !queue.currentSong || queue.currentSong.type !== 'radio') {
-                    await interaction.reply({ content: '❌ No radio station is currently playing to save as a favorite.', flags: MessageFlags.Ephemeral });
-                    return;
+            const prefs = getUserPreferences(userId);
+            let changed = false;
+
+            // Local helper so we do not crash if normalizePlaylistKey is
+            // missing in some deployed versions. We prefer the global
+            // normalizePlaylistKey if it exists, otherwise fall back to a
+            // simple trimmed string.
+            const toPlaylistKey = (url) => {
+                if (typeof normalizePlaylistKey === 'function') {
+                    return normalizePlaylistKey(url);
                 }
+                if (!url || typeof url !== 'string') return null;
+                return url.trim();
+            };
 
-                if (!Array.isArray(prefs.favoriteRadios)) {
-                    prefs.favoriteRadios = [];
-                }
+            // Handle favorites: playlist URLs or "radio" keyword
+            if (favorite) {
+                const favLower = favorite.toLowerCase();
 
-                const existing = prefs.favoriteRadios.some(r => r && r.url === queue.currentSong.url);
-                if (!existing) {
-                    prefs.favoriteRadios.push({
-                        name: queue.currentSong.title || 'Radio Station',
-                        url: queue.currentSong.url
+                if (favLower === 'radio') {
+                    const queue = queues.get(guildId);
+                    if (!queue || !queue.currentSong || queue.currentSong.type !== 'radio') {
+                        await interaction.editReply({ content: '❌ No radio station is currently playing to save as a favorite.' });
+                        return;
+                    }
+
+                    if (!Array.isArray(prefs.favoriteRadios)) {
+                        prefs.favoriteRadios = [];
+                    }
+
+                    const existing = prefs.favoriteRadios.some(r => r && r.url === queue.currentSong.url);
+                    if (!existing) {
+                        prefs.favoriteRadios.push({
+                            name: queue.currentSong.title || 'Radio Station',
+                            url: queue.currentSong.url
+                        });
+                        if (prefs.favoriteRadios.length > 20) {
+                            prefs.favoriteRadios.shift();
+                        }
+                    }
+                    changed = true;
+                } else {
+                    if (!Array.isArray(prefs.favoritePlaylists)) {
+                        prefs.favoritePlaylists = [];
+                    }
+
+                    const list = prefs.favoritePlaylists;
+                    const favKey = toPlaylistKey(favorite);
+                    const existingIndex = list.findIndex(entry => {
+                        if (!entry) return false;
+                        const url = typeof entry === 'string' ? entry : entry.url;
+                        return toPlaylistKey(url) === favKey;
                     });
-                    // Cap stored favorites to avoid unbounded growth
-                    if (prefs.favoriteRadios.length > 20) {
-                        prefs.favoriteRadios.shift();
+
+                    const trimmedName = favoriteName && favoriteName.trim().length > 0
+                        ? favoriteName.trim()
+                        : null;
+
+                    if (favoriteDelete) {
+                        // Delete matching playlist favorite if requested
+                        if (existingIndex >= 0) {
+                            list.splice(existingIndex, 1);
+                            changed = true;
+                        }
+                    } else if (existingIndex >= 0) {
+                        // Favorite exists; optionally rename if favorite_name provided
+                        if (trimmedName) {
+                            const entry = list[existingIndex];
+                            if (typeof entry === 'string') {
+                                list[existingIndex] = { name: trimmedName, url: entry };
+                            } else {
+                                entry.name = trimmedName;
+                            }
+                            changed = true;
+                        }
+                    } else {
+                        // New favorite; just store URL and optional custom name. Avoid
+                        // any remote lookups here to keep the command responsive.
+                        list.push({
+                            name: trimmedName || 'Playlist',
+                            url: favorite
+                        });
+
+                        if (list.length > 20) {
+                            list.shift();
+                        }
+                        changed = true;
                     }
                 }
-                changed = true;
-            } else {
-                if (!Array.isArray(prefs.favoritePlaylists)) {
-                    prefs.favoritePlaylists = [];
-                }
+            }
 
-                const existing = prefs.favoritePlaylists.some(p =>
-                    (typeof p === 'string' ? p === favorite : p && p.url === favorite)
+            if (shuffle !== null) {
+                prefs.shuffle = shuffle;
+                changed = true;
+            }
+            if (loop !== null) {
+                prefs.loop = loop;
+                changed = true;
+            }
+            if (volume !== null) {
+                const clampedVol = Math.max(0, Math.min(200, volume));
+                prefs.volume = clampedVol / 100;
+                prefs.volumePercent = clampedVol;
+                changed = true;
+            }
+
+            if (changed) {
+                saveUserPreferences();
+            }
+
+            const effectiveShuffle = typeof prefs.shuffle === 'boolean' ? (prefs.shuffle ? 'ON' : 'OFF') : 'Not set';
+            const effectiveLoop = typeof prefs.loop === 'boolean' ? (prefs.loop ? 'ON' : 'OFF') : 'Not set';
+            const effectiveVolume = typeof prefs.volumePercent === 'number' ? `${prefs.volumePercent}%` : 'Not set';
+
+            let favoritePlaylistsText = 'None';
+            if (Array.isArray(prefs.favoritePlaylists) && prefs.favoritePlaylists.length > 0) {
+                const sample = prefs.favoritePlaylists
+                    .slice(0, 3)
+                    .map(p => (typeof p === 'string' ? p : (p.name || p.url || 'Playlist')))
+                    .join('\n');
+                if (prefs.favoritePlaylists.length > 3) {
+                    favoritePlaylistsText = `${sample}\n...and ${prefs.favoritePlaylists.length - 3} more`;
+                } else {
+                    favoritePlaylistsText = sample;
+                }
+            }
+
+            let favoriteRadiosText = 'None';
+            if (Array.isArray(prefs.favoriteRadios) && prefs.favoriteRadios.length > 0) {
+                const names = prefs.favoriteRadios
+                    .slice(0, 3)
+                    .map(r => r && r.name ? r.name : 'Radio Station')
+                    .join('\n');
+                if (prefs.favoriteRadios.length > 3) {
+                    favoriteRadiosText = `${names}\n...and ${prefs.favoriteRadios.length - 3} more`;
+                } else {
+                    favoriteRadiosText = names;
+                }
+            }
+
+            const embed = new EmbedBuilder()
+                .setColor('#1DB954')
+                .setTitle('⚙️ Your Playback Preferences')
+                .addFields(
+                    { name: 'Shuffle', value: effectiveShuffle, inline: true },
+                    { name: 'Loop', value: effectiveLoop, inline: true },
+                    { name: 'Volume', value: effectiveVolume, inline: true },
+                    { name: 'Favorite Playlists', value: favoritePlaylistsText, inline: false },
+                    { name: 'Favorite Radio Stations', value: favoriteRadiosText, inline: false }
                 );
 
-                if (!existing) {
-                    let playlistName = null;
-                    try {
-                        playlistName = await resolvePlaylistNameFromUrl(favorite);
-                    } catch (err) {
-                        console.error('Error resolving favorite playlist name:', err.message || err);
-                    }
-
-                    prefs.favoritePlaylists.push({
-                    name: playlistName || 'Playlist',
-                        url: favorite
-                    });
-
-                    if (prefs.favoritePlaylists.length > 20) {
-                        prefs.favoritePlaylists.shift();
-                    }
+            await interaction.editReply({ embeds: [embed] });
+        } catch (err) {
+            console.error('prefrence command failed:', err);
+            try {
+                if (interaction.deferred || interaction.replied) {
+                    await interaction.editReply({ content: '❌ Failed to update your preferences. Please try again.' });
+                } else {
+                    await interaction.reply({ content: '❌ Failed to update your preferences. Please try again.', flags: MessageFlags.Ephemeral });
                 }
-                changed = true;
+            } catch (replyErr) {
+                console.error('Failed to send error reply for /prefrence:', replyErr);
             }
         }
-
-        if (shuffle !== null) {
-            prefs.shuffle = shuffle;
-            changed = true;
-        }
-        if (loop !== null) {
-            prefs.loop = loop;
-            changed = true;
-        }
-        if (volume !== null) {
-            const clampedVol = Math.max(0, Math.min(200, volume));
-            prefs.volume = clampedVol / 100;
-            prefs.volumePercent = clampedVol;
-            changed = true;
-        }
-
-        if (changed) {
-            saveUserPreferences();
-        }
-
-        const effectiveShuffle = typeof prefs.shuffle === 'boolean' ? (prefs.shuffle ? 'ON' : 'OFF') : 'Not set';
-        const effectiveLoop = typeof prefs.loop === 'boolean' ? (prefs.loop ? 'ON' : 'OFF') : 'Not set';
-        const effectiveVolume = typeof prefs.volumePercent === 'number' ? `${prefs.volumePercent}%` : 'Not set';
-
-        let favoritePlaylistsText = 'None';
-        if (Array.isArray(prefs.favoritePlaylists) && prefs.favoritePlaylists.length > 0) {
-            const sample = prefs.favoritePlaylists
-                .slice(0, 3)
-                .map(p => (typeof p === 'string' ? p : (p.name || p.url || 'Playlist')))
-                .join('\n');
-            if (prefs.favoritePlaylists.length > 3) {
-                favoritePlaylistsText = `${sample}\n...and ${prefs.favoritePlaylists.length - 3} more`;
-            } else {
-                favoritePlaylistsText = sample;
-            }
-        }
-
-        let favoriteRadiosText = 'None';
-        if (Array.isArray(prefs.favoriteRadios) && prefs.favoriteRadios.length > 0) {
-            const names = prefs.favoriteRadios
-                .slice(0, 3)
-                .map(r => r && r.name ? r.name : 'Radio Station')
-                .join('\n');
-            if (prefs.favoriteRadios.length > 3) {
-                favoriteRadiosText = `${names}\n...and ${prefs.favoriteRadios.length - 3} more`;
-            } else {
-                favoriteRadiosText = names;
-            }
-        }
-
-        const embed = new EmbedBuilder()
-            .setColor('#1DB954')
-            .setTitle('⚙️ Your Playback Preferences')
-            .addFields(
-                { name: 'Shuffle', value: effectiveShuffle, inline: true },
-                { name: 'Loop', value: effectiveLoop, inline: true },
-                { name: 'Volume', value: effectiveVolume, inline: true },
-                { name: 'Favorite Playlists', value: favoritePlaylistsText, inline: false },
-                { name: 'Favorite Radio Stations', value: favoriteRadiosText, inline: false }
-            );
-
-        await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
     }
 });
 
