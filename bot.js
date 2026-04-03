@@ -1,12 +1,12 @@
 const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, SlashCommandBuilder, StringSelectMenuBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, MessageFlags } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType, VoiceConnectionStatus } = require('@discordjs/voice');
-const { spawn, exec } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const SpotifyWebApi = require('spotify-web-api-node');
 
-const execPromise = promisify(exec);
+const execFilePromise = promisify(execFile);
 
 // Resolve config path relative to this file so systemd/cwd do not matter
 const configPath = path.join(__dirname, 'config.json');
@@ -23,7 +23,7 @@ const RAW_YTDLP_ARGS = Array.isArray(config.ytdlp_args)
     ? config.ytdlp_args
     : (config.ytdlp_cookies ? ['--cookies', config.ytdlp_cookies] : []);
 
-const YTDLP_ARGS = ['--no-config', ...RAW_YTDLP_ARGS];
+const YTDLP_ARGS = ['--no-config', ...RAW_YTDLP_ARGS.map((arg, index) => sanitizeProcessArgument(arg, `config.ytdlp_args[${index}]`))];
 
 // Optional explicit format for playback; if omitted, yt-dlp chooses the best.
 // Example: "best", "bestaudio", or a more complex selector.
@@ -31,9 +31,122 @@ const YTDLP_PLAY_FORMAT = typeof config.ytdlp_format === 'string' && config.ytdl
     ? config.ytdlp_format.trim()
     : null;
 
+function getPositiveIntegerConfig(value, fallback) {
+    const parsed = Number(value);
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sanitizeProcessArgument(value, fieldName, options = {}) {
+    const {
+        maxLength = 4096,
+        trim = false,
+        collapseWhitespace = false,
+        allowLeadingDash = true
+    } = options;
+
+    if (value === null || value === undefined) {
+        throw new Error(`${fieldName} is required.`);
+    }
+
+    if (typeof value !== 'string') {
+        value = String(value);
+    }
+
+    if (/[\u0000-\u001F\u007F]/.test(value)) {
+        throw new Error(`${fieldName} contains control characters.`);
+    }
+
+    let sanitized = value;
+    if (collapseWhitespace) {
+        sanitized = sanitized.replace(/\s+/g, ' ');
+    }
+    if (trim) {
+        sanitized = sanitized.trim();
+    }
+
+    if (!sanitized) {
+        throw new Error(`${fieldName} cannot be empty.`);
+    }
+
+    if (sanitized.length > maxLength) {
+        throw new Error(`${fieldName} is too long.`);
+    }
+
+    if (!allowLeadingDash && sanitized.startsWith('-')) {
+        throw new Error(`${fieldName} cannot start with "-".`);
+    }
+
+    return sanitized;
+}
+
+function sanitizeSearchQuery(query) {
+    return sanitizeProcessArgument(query, 'Search query', {
+        maxLength: MAX_USER_QUERY_LENGTH,
+        trim: true,
+        collapseWhitespace: true,
+        allowLeadingDash: true
+    });
+}
+
+function sanitizeUserQuery(query) {
+    return sanitizeProcessArgument(query, 'Query', {
+        maxLength: Math.max(MAX_USER_QUERY_LENGTH, MAX_EXTERNAL_URL_LENGTH),
+        trim: true,
+        collapseWhitespace: true,
+        allowLeadingDash: true
+    });
+}
+
+function hostnameMatches(hostname, allowedHosts) {
+    const normalizedHost = String(hostname || '').toLowerCase();
+    return allowedHosts.some((allowedHost) => (
+        normalizedHost === allowedHost || normalizedHost.endsWith(`.${allowedHost}`)
+    ));
+}
+
+function sanitizeHttpUrl(value, fieldName, allowedHosts = null) {
+    const sanitized = sanitizeProcessArgument(value, fieldName, {
+        maxLength: MAX_EXTERNAL_URL_LENGTH,
+        trim: true,
+        collapseWhitespace: false,
+        allowLeadingDash: false
+    });
+
+    if (/\s/.test(sanitized)) {
+        throw new Error(`${fieldName} cannot contain whitespace.`);
+    }
+
+    let parsed;
+    try {
+        parsed = new URL(sanitized);
+    } catch {
+        throw new Error(`${fieldName} must be a valid URL.`);
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error(`${fieldName} must use http or https.`);
+    }
+
+    if (allowedHosts && !hostnameMatches(parsed.hostname, allowedHosts)) {
+        throw new Error(`${fieldName} must point to an allowed host.`);
+    }
+
+    return parsed.toString();
+}
+
+function sanitizeYouTubeUrl(value) {
+    return sanitizeHttpUrl(value, 'YouTube URL', ALLOWED_YOUTUBE_HOSTS);
+}
+
+function sanitizeRadioStreamUrl(value) {
+    return sanitizeHttpUrl(value, 'Radio stream URL');
+}
+
 // Per-user preference storage (simple JSON file on disk)
 const USER_PREFS_PATH = path.join(__dirname, 'user_prefs.json');
+const USER_PREFS_TMP_PATH = `${USER_PREFS_PATH}.${process.pid}.tmp`;
 let userPreferences = {};
+let userPreferencesWriteChain = Promise.resolve();
 
 function loadUserPreferences() {
     try {
@@ -48,11 +161,17 @@ function loadUserPreferences() {
 }
 
 function saveUserPreferences() {
-    try {
-        fs.writeFileSync(USER_PREFS_PATH, JSON.stringify(userPreferences, null, 2), 'utf8');
-    } catch (err) {
-        console.error('Failed to save user preferences:', err.message || err);
-    }
+    const snapshot = JSON.stringify(userPreferences, null, 2);
+    userPreferencesWriteChain = userPreferencesWriteChain
+        .catch(() => undefined)
+        .then(async () => {
+            await fs.promises.writeFile(USER_PREFS_TMP_PATH, snapshot, 'utf8');
+            await fs.promises.rename(USER_PREFS_TMP_PATH, USER_PREFS_PATH);
+        })
+        .catch((err) => {
+            console.error('Failed to save user preferences:', err.message || err);
+        });
+    return userPreferencesWriteChain;
 }
 
 function getUserPreferences(userId) {
@@ -80,6 +199,134 @@ if (config.spotify_client_id && config.spotify_client_secret) {
     });
 }
 
+const MAX_CONCURRENT_YTDLP_LOOKUPS = getPositiveIntegerConfig(config.max_concurrent_ytdlp_lookups, 4);
+const MAX_CONCURRENT_SPOTIFY_REQUESTS = getPositiveIntegerConfig(config.max_concurrent_spotify_requests, 4);
+const MAX_CONCURRENT_RADIO_REQUESTS = getPositiveIntegerConfig(config.max_concurrent_radio_requests, 4);
+const LOOKUP_CACHE_TTL_MS = getPositiveIntegerConfig(config.lookup_cache_ttl_ms, 5 * 60 * 1000);
+const RADIO_STATION_CACHE_TTL_MS = getPositiveIntegerConfig(config.radio_station_cache_ttl_ms, 5 * 60 * 1000);
+const RADIO_SESSION_TTL_MS = getPositiveIntegerConfig(config.radio_session_ttl_ms, 15 * 60 * 1000);
+const MAX_LOOKUP_CACHE_ENTRIES = getPositiveIntegerConfig(config.lookup_cache_max_entries, 250);
+const MAX_USER_QUERY_LENGTH = getPositiveIntegerConfig(config.max_user_query_length, 300);
+const MAX_EXTERNAL_URL_LENGTH = getPositiveIntegerConfig(config.max_external_url_length, 2048);
+const YTDLP_LOOKUP_TIMEOUT_MS = getPositiveIntegerConfig(config.ytdlp_lookup_timeout_ms, 15000);
+const YTDLP_LOOKUP_MAX_BUFFER = getPositiveIntegerConfig(config.ytdlp_lookup_max_buffer, 8 * 1024 * 1024);
+const ALLOWED_YOUTUBE_HOSTS = [
+    'youtube.com',
+    'www.youtube.com',
+    'm.youtube.com',
+    'music.youtube.com',
+    'youtu.be'
+];
+
+let spotifyTokenRefreshPromise = null;
+
+class AsyncLimiter {
+    constructor(limit) {
+        this.limit = Math.max(1, limit);
+        this.activeCount = 0;
+        this.waitQueue = [];
+    }
+
+    async run(task) {
+        if (this.activeCount >= this.limit) {
+            await new Promise(resolve => this.waitQueue.push(resolve));
+        }
+
+        this.activeCount += 1;
+        try {
+            return await task();
+        } finally {
+            this.activeCount -= 1;
+            const next = this.waitQueue.shift();
+            if (next) {
+                next();
+            }
+        }
+    }
+}
+
+const ytDlpLookupLimiter = new AsyncLimiter(MAX_CONCURRENT_YTDLP_LOOKUPS);
+const spotifyRequestLimiter = new AsyncLimiter(MAX_CONCURRENT_SPOTIFY_REQUESTS);
+const radioRequestLimiter = new AsyncLimiter(MAX_CONCURRENT_RADIO_REQUESTS);
+
+const youtubeSearchCache = new Map();
+const youtubeSearchInFlight = new Map();
+const radioStationCache = new Map();
+const radioStationInFlight = new Map();
+
+function getCachedValue(cache, key) {
+    const entry = cache.get(key);
+    if (!entry) {
+        return null;
+    }
+
+    if (entry.expiresAt <= Date.now()) {
+        cache.delete(key);
+        return null;
+    }
+
+    return entry.value;
+}
+
+function pruneCache(cache) {
+    const now = Date.now();
+    for (const [key, entry] of cache.entries()) {
+        if (!entry || entry.expiresAt <= now) {
+            cache.delete(key);
+        }
+    }
+
+    while (cache.size > MAX_LOOKUP_CACHE_ENTRIES) {
+        const oldestKey = cache.keys().next().value;
+        if (oldestKey === undefined) {
+            break;
+        }
+        cache.delete(oldestKey);
+    }
+}
+
+function setCachedValue(cache, key, value, ttlMs) {
+    cache.delete(key);
+    cache.set(key, {
+        value,
+        expiresAt: Date.now() + ttlMs
+    });
+    pruneCache(cache);
+    return value;
+}
+
+function getOrCreateInFlight(map, key, factory) {
+    if (map.has(key)) {
+        return map.get(key);
+    }
+
+    const promise = Promise.resolve()
+        .then(factory)
+        .finally(() => {
+            map.delete(key);
+        });
+
+    map.set(key, promise);
+    return promise;
+}
+
+async function runYtDlpLookupCommand(args, options = {}) {
+    const safeArgs = Array.isArray(args)
+        ? args.map((arg, index) => sanitizeProcessArgument(arg, `yt-dlp argument ${index + 1}`))
+        : [];
+
+    return ytDlpLookupLimiter.run(() => execFilePromise(
+        YTDLP_BIN,
+        [...YTDLP_ARGS, ...safeArgs],
+        {
+            timeout: YTDLP_LOOKUP_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+            maxBuffer: YTDLP_LOOKUP_MAX_BUFFER,
+            ...options
+        }
+    ));
+}
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
@@ -97,8 +344,55 @@ const RADIO_BROWSER_BASE = 'https://de1.api.radio-browser.info/json';
 // Station pagination size for select menus (Discord limit is 25 options)
 const RADIO_PAGE_SIZE = 25;
 
-// Per-user radio browsing sessions (stores last fetched station list)
+// Session-scoped radio browse state keyed by the interaction that created the
+// station list, so simultaneous flows across guilds do not collide.
 const radioSessions = new Map();
+
+function buildRadioCustomId(baseId, sessionId) {
+    return `${baseId}:${sessionId}`;
+}
+
+function extractRadioSessionId(customId, baseId) {
+    const prefix = `${baseId}:`;
+    return customId.startsWith(prefix) ? customId.slice(prefix.length) : null;
+}
+
+function pruneExpiredRadioSessions() {
+    const now = Date.now();
+    for (const [sessionId, session] of radioSessions.entries()) {
+        if (!session || session.expiresAt <= now) {
+            radioSessions.delete(sessionId);
+        }
+    }
+}
+
+function setRadioSession(sessionId, session) {
+    pruneExpiredRadioSessions();
+    radioSessions.set(sessionId, {
+        ...session,
+        expiresAt: Date.now() + RADIO_SESSION_TTL_MS
+    });
+    return radioSessions.get(sessionId);
+}
+
+function getRadioSession(sessionId, interaction) {
+    const session = radioSessions.get(sessionId);
+    if (!session) {
+        return null;
+    }
+
+    if (session.expiresAt <= Date.now()) {
+        radioSessions.delete(sessionId);
+        return null;
+    }
+
+    if (session.userId !== interaction.user.id || session.guildId !== interaction.guildId) {
+        return null;
+    }
+
+    session.expiresAt = Date.now() + RADIO_SESSION_TTL_MS;
+    return session;
+}
 
 // Periodic safety check to ensure we eventually leave empty voice channels
 // even if a voiceStateUpdate event is missed for some reason.
@@ -112,6 +406,12 @@ setInterval(() => {
 		}
 	}
 }, 60 * 1000); // every 60 seconds
+
+setInterval(() => {
+    pruneExpiredRadioSessions();
+    pruneCache(youtubeSearchCache);
+    pruneCache(radioStationCache);
+}, 5 * 60 * 1000);
 
 class MusicQueue {
     constructor(guildId) {
@@ -311,8 +611,9 @@ class MusicQueue {
 
             if (this.currentSong.type === 'radio') {
                 console.log('📻 Streaming radio via ffmpeg...');
+                const safeRadioUrl = sanitizeRadioStreamUrl(this.currentSong.url);
                 const ffmpeg = spawn('ffmpeg', [
-                    '-i', this.currentSong.url,
+                    '-i', safeRadioUrl,
                     '-f', 's16le',
                     '-ar', '48000',
                     '-ac', '2',
@@ -373,13 +674,17 @@ class MusicQueue {
 					}
 				}
 
+                const safePlaybackUrl = sanitizeYouTubeUrl(this.currentSong.url);
+                this.currentSong.url = safePlaybackUrl;
+
 				// Optional explicit format if configured; otherwise let yt-dlp decide.
 				const ytdlpArgs = [
 					...(YTDLP_PLAY_FORMAT ? ['-f', YTDLP_PLAY_FORMAT] : []),
 					'-o', '-',
 					'--no-warnings',
 					'--no-playlist',
-					this.currentSong.url
+                    '--',
+					safePlaybackUrl
 				];
 				const ytdlp = spawn(YTDLP_BIN, [...YTDLP_ARGS, ...ytdlpArgs]);
 
@@ -498,10 +803,11 @@ class MusicQueue {
 
 async function getSongInfo(query) {
     try {
-        console.log('🔍 Query:', query);
+        const sanitizedQuery = sanitizeUserQuery(query);
+        console.log('🔍 Query:', sanitizedQuery);
 
         // Spotify URL detection (tracks & playlists)
-        const spotifyInfo = parseSpotifyUrl(query);
+        const spotifyInfo = parseSpotifyUrl(sanitizedQuery);
         if (spotifyInfo && spotifyApi) {
             const api = await ensureSpotifyAccessToken();
             if (api) {
@@ -517,13 +823,13 @@ async function getSongInfo(query) {
         }
 
         // Radio station detection
-        if (query.match(/\.(mp3|m3u8|aac|pls)(\?.*)?$/i) || 
-            query.includes('stream.') || 
-            query.includes('ihrhls.com') || 
-            query.includes('streamguys')) {
+        if (sanitizedQuery.match(/\.(mp3|m3u8|aac|pls)(\?.*)?$/i) || 
+            sanitizedQuery.includes('stream.') || 
+            sanitizedQuery.includes('ihrhls.com') || 
+            sanitizedQuery.includes('streamguys')) {
             return {
                 title: 'Radio Stream',
-                url: query,
+                url: sanitizeRadioStreamUrl(sanitizedQuery),
                 type: 'radio'
             };
         }
@@ -536,16 +842,29 @@ async function ensureSpotifyAccessToken() {
         return spotifyApi;
     }
 
-    try {
+    if (spotifyTokenRefreshPromise) {
+        return spotifyTokenRefreshPromise;
+    }
+
+    spotifyTokenRefreshPromise = spotifyRequestLimiter.run(async () => {
+        const refreshedAt = Date.now();
+        if (refreshedAt < spotifyTokenExpiresAt - 60000) {
+            return spotifyApi;
+        }
+
         const data = await spotifyApi.clientCredentialsGrant();
         spotifyApi.setAccessToken(data.body.access_token);
-        spotifyTokenExpiresAt = now + (data.body.expires_in * 1000);
+        spotifyTokenExpiresAt = refreshedAt + (data.body.expires_in * 1000);
         console.log('✅ Spotify access token refreshed');
         return spotifyApi;
-    } catch (err) {
+    }).catch((err) => {
         console.error('Spotify token fetch failed:', err.message || err);
         return null;
-    }
+    }).finally(() => {
+        spotifyTokenRefreshPromise = null;
+    });
+
+    return spotifyTokenRefreshPromise;
 }
 
 // Build a normalized key for matching playlist favorites across different
@@ -595,7 +914,7 @@ function parseSpotifyUrl(url) {
 
 async function resolveSpotifyTrack(api, trackId) {
     try {
-        const data = await api.getTrack(trackId);
+        const data = await spotifyRequestLimiter.run(() => api.getTrack(trackId));
         const track = data.body;
         const artists = (track.artists || []).map(a => a.name).join(', ');
         const searchQuery = `${track.name} ${artists}`;
@@ -626,10 +945,10 @@ async function fetchSpotifyPlaylistTracks(api, playlistId, maxTracks) {
     let offset = 0;
 
     while (collected.length < maxTracks) {
-        const page = await api.getPlaylistTracks(playlistId, {
+        const page = await spotifyRequestLimiter.run(() => api.getPlaylistTracks(playlistId, {
             offset,
             limit: pageSize
-        });
+        }));
 
         const items = page.body.items || [];
         if (items.length === 0) {
@@ -694,7 +1013,7 @@ async function resolvePlaylistNameFromUrl(url) {
         if (spotifyInfo && spotifyInfo.type === 'playlist' && spotifyApi) {
             const api = await ensureSpotifyAccessToken();
             if (api) {
-                const data = await api.getPlaylist(spotifyInfo.id);
+                const data = await spotifyRequestLimiter.run(() => api.getPlaylist(spotifyInfo.id));
                 if (data && data.body && data.body.name) {
                     return data.body.name;
                 }
@@ -707,14 +1026,14 @@ async function resolvePlaylistNameFromUrl(url) {
     // Fallback: use yt-dlp to inspect the playlist. This can be slow, so we
     // run it with a timeout to avoid hanging the whole command.
     try {
+        const safePlaylistUrl = sanitizeYouTubeUrl(url);
         const playlistArgs = [
             '--flat-playlist',
             '--dump-json',
-            url
+            '--',
+            safePlaylistUrl
         ];
-        const allArgs = [...YTDLP_ARGS, ...playlistArgs];
-        const cmd = `${YTDLP_BIN} ${allArgs.map(a => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')}`;
-        const { stdout } = await execPromise(cmd, { timeout: 15000 });
+        const { stdout } = await runYtDlpLookupCommand(playlistArgs, { timeout: YTDLP_LOOKUP_TIMEOUT_MS });
         const firstLine = stdout
             .trim()
             .split('\n')
@@ -735,18 +1054,18 @@ async function resolvePlaylistNameFromUrl(url) {
 }
 
         // Playlist detection
-        if (query.includes('playlist?list=') || query.includes('&list=')) {
+        if (sanitizedQuery.includes('playlist?list=') || sanitizedQuery.includes('&list=')) {
             console.log('📋 Detected playlist, fetching videos...');
 
             try {
+                const safePlaylistUrl = sanitizeYouTubeUrl(sanitizedQuery);
                 const playlistArgs = [
                     '--flat-playlist',
                     '--dump-json',
-                    query
+                    '--',
+                    safePlaylistUrl
                 ];
-                const allArgs = [...YTDLP_ARGS, ...playlistArgs];
-                const cmd = `${YTDLP_BIN} ${allArgs.map(a => `"${String(a).replace(/"/g, '\\"')}"`).join(' ')}`;
-                const { stdout } = await execPromise(cmd);
+                const { stdout } = await runYtDlpLookupCommand(playlistArgs);
                 const videos = stdout
                     .trim()
                     .split('\n')
@@ -774,17 +1093,17 @@ async function resolvePlaylistNameFromUrl(url) {
         }
 
         // Direct YouTube URL
-        if (query.includes('youtube.com/watch') || query.includes('youtu.be')) {
+        if (sanitizedQuery.includes('youtube.com/watch') || sanitizedQuery.includes('youtu.be')) {
             return {
                 title: 'YouTube Video',
-                url: query,
+                url: sanitizeYouTubeUrl(sanitizedQuery),
                 thumbnail: null,
                 type: 'youtube'
             };
         }
 
         // Search YouTube using yt-dlp
-        const ytResults = await searchYouTube(query, 1);
+        const ytResults = await searchYouTube(sanitizedQuery, 1);
         if (ytResults && ytResults.length > 0) {
             const v = ytResults[0];
             return {
@@ -806,63 +1125,55 @@ async function resolvePlaylistNameFromUrl(url) {
 
 // Use yt-dlp CLI to search YouTube using spawn (no shell) to avoid quoting issues.
 async function searchYouTube(query, maxResults = 1) {
-    return new Promise((resolve) => {
-        try {
-            const searchQuery = String(query || '');
-            const args = [
-                ...YTDLP_ARGS,
-                '--flat-playlist',
-                '--dump-json',
-                `ytsearch${maxResults}:${searchQuery}`
-            ];
+    let searchQuery;
+    try {
+        searchQuery = sanitizeSearchQuery(query);
+    } catch (err) {
+        console.error('Rejected unsafe YouTube search query:', err.message || err);
+        return [];
+    }
 
-            const ytdlp = spawn(YTDLP_BIN, args);
-            let stdout = '';
-            let stderr = '';
+    const resultLimit = Number.isInteger(maxResults) && maxResults > 0
+        ? Math.min(maxResults, 10)
+        : 1;
 
-            ytdlp.stdout.on('data', (data) => {
-                stdout += data.toString();
-            });
+    const cacheKey = `${resultLimit}:${searchQuery.toLowerCase()}`;
+    const cachedResults = getCachedValue(youtubeSearchCache, cacheKey);
+    if (cachedResults) {
+        return cachedResults.map(result => ({ ...result }));
+    }
 
-            ytdlp.stderr.on('data', (data) => {
-                stderr += data.toString();
-            });
-
-            ytdlp.on('close', (code) => {
-                if (code && code !== 0 && code !== 255) {
-                    const firstErrLine = (stderr || '').split('\n').find(l => l.trim()) || stderr;
-                    console.error('YouTube search failed (code %s): %s', code, firstErrLine || 'unknown error');
-                    resolve([]);
-                    return;
+    const results = await getOrCreateInFlight(youtubeSearchInFlight, cacheKey, async () => {
+        const freshResults = await runYtDlpLookupCommand([
+            '--flat-playlist',
+            '--dump-json',
+            `ytsearch${resultLimit}:${searchQuery}`
+        ]).then(({ stdout }) => {
+            const lines = stdout.trim().split('\n').filter(Boolean);
+            return lines.map(line => {
+                try {
+                    const data = JSON.parse(line);
+                    return {
+                        title: data.title,
+                        url: `https://www.youtube.com/watch?v=${data.id}`,
+                        thumbnail: data.thumbnails && data.thumbnails[0] ? data.thumbnails[0].url : null,
+                        type: 'youtube'
+                    };
+                } catch {
+                    return null;
                 }
+            }).filter(v => v !== null);
+        }).catch((err) => {
+            const firstErrLine = (err.stderr || '').split('\n').find(l => l.trim()) || err.message || 'unknown error';
+            console.error('YouTube search failed:', firstErrLine);
+            return [];
+        });
 
-                const lines = stdout.trim().split('\n').filter(Boolean);
-                const results = lines.map(line => {
-                    try {
-                        const data = JSON.parse(line);
-                        return {
-                            title: data.title,
-                            url: `https://www.youtube.com/watch?v=${data.id}`,
-                            thumbnail: data.thumbnails && data.thumbnails[0] ? data.thumbnails[0].url : null,
-                            type: 'youtube'
-                        };
-                    } catch {
-                        return null;
-                    }
-                }).filter(v => v !== null);
-
-                resolve(results);
-            });
-
-            ytdlp.on('error', (err) => {
-                console.error('YouTube search spawn failed:', err.message || err);
-                resolve([]);
-            });
-        } catch (err) {
-            console.error('YouTube search failed:', err.message || err);
-            resolve([]);
-        }
+        setCachedValue(youtubeSearchCache, cacheKey, freshResults, LOOKUP_CACHE_TTL_MS);
+        return freshResults;
     });
+
+    return results.map(result => ({ ...result }));
 }
 
 // ==================== SPOTIFY HELPERS ====================
@@ -930,53 +1241,88 @@ function getUniqueStations(stations, maxCount = 100) {
 
 // Fetch stations from Radio Browser for a given tag/language
 async function fetchRadioStations({ tag, language, limit = 100 }) {
-    try {
-        const params = new URLSearchParams();
-        if (tag) params.set('tag', tag);
-        if (language) params.set('language', language);
-        params.set('order', 'votes');
-        params.set('reverse', 'true');
-        params.set('limit', String(limit));
+    const cacheKey = JSON.stringify({
+        tag: tag || '',
+        language: language || '',
+        limit
+    });
 
-        const url = `${RADIO_BROWSER_BASE}/stations/search?${params.toString()}`;
-        const res = await fetch(url);
-        if (!res.ok) {
-            console.error('Radio Browser HTTP error:', res.status);
-            return [];
-        }
-
-        const contentType = (res.headers.get('content-type') || '').toLowerCase();
-        if (!contentType.includes('application/json') && !contentType.includes('json')) {
-            const body = await res.text();
-            console.error('Radio Browser non-JSON response (first 200 chars):', body.slice(0, 200));
-            return [];
-        }
-
-        let data;
-        try {
-            data = await res.json();
-        } catch (parseErr) {
-            console.error('Radio Browser JSON parse failed:', parseErr.message || parseErr);
-            return [];
-        }
-        return data
-            .filter(s => s && (s.url_resolved || s.url))
-            .map(s => ({
-                name: s.name || s.stationuuid || 'Unknown Station',
-                url: s.url_resolved || s.url
-            }));
-    } catch (err) {
-        console.error('Radio Browser fetch failed:', err.message);
-        return [];
+    const cachedStations = getCachedValue(radioStationCache, cacheKey);
+    if (cachedStations) {
+        return cachedStations.map((station) => ({ ...station }));
     }
+
+    const stations = await getOrCreateInFlight(radioStationInFlight, cacheKey, async () => {
+        const fetchedStations = await radioRequestLimiter.run(async () => {
+            try {
+                const params = new URLSearchParams();
+                if (tag) params.set('tag', tag);
+                if (language) params.set('language', language);
+                params.set('order', 'votes');
+                params.set('reverse', 'true');
+                params.set('limit', String(limit));
+
+                const url = `${RADIO_BROWSER_BASE}/stations/search?${params.toString()}`;
+                const res = await fetch(url);
+                if (!res.ok) {
+                    console.error('Radio Browser HTTP error:', res.status);
+                    return [];
+                }
+
+                const contentType = (res.headers.get('content-type') || '').toLowerCase();
+                if (!contentType.includes('application/json') && !contentType.includes('json')) {
+                    const body = await res.text();
+                    console.error('Radio Browser non-JSON response (first 200 chars):', body.slice(0, 200));
+                    return [];
+                }
+
+                let data;
+                try {
+                    data = await res.json();
+                } catch (parseErr) {
+                    console.error('Radio Browser JSON parse failed:', parseErr.message || parseErr);
+                    return [];
+                }
+
+                return data
+                    .filter(s => s && (s.url_resolved || s.url))
+                    .map((s) => {
+                        try {
+                            return {
+                                name: s.name || s.stationuuid || 'Unknown Station',
+                                url: sanitizeRadioStreamUrl(s.url_resolved || s.url)
+                            };
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .filter(Boolean);
+            } catch (err) {
+                console.error('Radio Browser fetch failed:', err.message);
+                return [];
+            }
+        });
+
+        setCachedValue(radioStationCache, cacheKey, fetchedStations, RADIO_STATION_CACHE_TTL_MS);
+        return fetchedStations;
+    });
+
+    return stations.map((station) => ({ ...station }));
 }
 
-// Build station select + pagination buttons for the current user session
-function buildStationComponents(userId) {
-    const session = radioSessions.get(userId);
+// Build station select + pagination buttons for the current radio session
+function buildStationComponents(sessionId) {
+    const session = radioSessions.get(sessionId);
     if (!session || !Array.isArray(session.stations) || session.stations.length === 0) {
         return null;
     }
+
+    if (session.expiresAt <= Date.now()) {
+        radioSessions.delete(sessionId);
+        return null;
+    }
+
+    session.expiresAt = Date.now() + RADIO_SESSION_TTL_MS;
 
     const { stations, genre, subgroup, language } = session;
     let { page } = session;
@@ -995,7 +1341,7 @@ function buildStationComponents(userId) {
     }));
 
     const selectMenu = new StringSelectMenuBuilder()
-        .setCustomId('radio_station')
+        .setCustomId(buildRadioCustomId('radio_station', sessionId))
         .setPlaceholder('Choose a station')
         .addOptions(options);
 
@@ -1005,7 +1351,7 @@ function buildStationComponents(userId) {
     if (page > 0) {
         buttons.push(
             new ButtonBuilder()
-                .setCustomId('radio_station_prev')
+                .setCustomId(buildRadioCustomId('radio_station_prev', sessionId))
                 .setLabel('Previous')
                 .setStyle(ButtonStyle.Secondary)
         );
@@ -1013,7 +1359,7 @@ function buildStationComponents(userId) {
     if (page < totalPages - 1) {
         buttons.push(
             new ButtonBuilder()
-                .setCustomId('radio_station_next')
+                .setCustomId(buildRadioCustomId('radio_station_next', sessionId))
                 .setLabel('Next')
                 .setStyle(ButtonStyle.Secondary)
         );
@@ -1266,16 +1612,20 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            // Store session for pagination and selection
-            radioSessions.set(interaction.user.id, {
+            // Store session for pagination and selection using the current
+            // interaction ID so simultaneous server flows stay isolated.
+            const sessionId = interaction.id;
+            setRadioSession(sessionId, {
                 stations,
+                userId: interaction.user.id,
+                guildId,
                 genre,
                 subgroup,
                 language,
                 page: 0
             });
 
-            const built = buildStationComponents(interaction.user.id);
+            const built = buildStationComponents(sessionId);
             if (!built) {
                 await interaction.update({
                     content: '❌ Failed to build station list.',
@@ -1511,9 +1861,10 @@ client.on('interactionCreate', async interaction => {
             return;
         }
 
-        if (interaction.customId === 'radio_station') {
+        const radioStationSessionId = extractRadioSessionId(interaction.customId, 'radio_station');
+        if (radioStationSessionId) {
             const index = parseInt(interaction.values[0], 10);
-            const session = radioSessions.get(interaction.user.id);
+            const session = getRadioSession(radioStationSessionId, interaction);
 
             if (!session || !Array.isArray(session.stations) || Number.isNaN(index) || !session.stations[index]) {
                 await interaction.update({ content: '❌ Unable to load that station.', components: [], embeds: [] });
@@ -1569,12 +1920,16 @@ client.on('interactionCreate', async interaction => {
                 )
                 .setTimestamp();
 
+            radioSessions.delete(radioStationSessionId);
             await interaction.update({ content: null, embeds: [embed], components: [] });
             return;
         }
     } else if (interaction.isButton()) {
-        if (interaction.customId === 'radio_station_prev' || interaction.customId === 'radio_station_next') {
-            const session = radioSessions.get(interaction.user.id);
+        const previousRadioSessionId = extractRadioSessionId(interaction.customId, 'radio_station_prev');
+        const nextRadioSessionId = extractRadioSessionId(interaction.customId, 'radio_station_next');
+        if (previousRadioSessionId || nextRadioSessionId) {
+            const sessionId = previousRadioSessionId || nextRadioSessionId;
+            const session = getRadioSession(sessionId, interaction);
             if (!session || !Array.isArray(session.stations) || session.stations.length === 0) {
                 await interaction.update({
                     content: '❌ Station list expired. Please run /radio again.',
@@ -1586,13 +1941,13 @@ client.on('interactionCreate', async interaction => {
 
             const totalPages = Math.max(1, Math.ceil(session.stations.length / RADIO_PAGE_SIZE));
 
-            if (interaction.customId === 'radio_station_prev' && session.page > 0) {
+            if (previousRadioSessionId && session.page > 0) {
                 session.page -= 1;
-            } else if (interaction.customId === 'radio_station_next' && session.page < totalPages - 1) {
+            } else if (nextRadioSessionId && session.page < totalPages - 1) {
                 session.page += 1;
             }
 
-            const built = buildStationComponents(interaction.user.id);
+            const built = buildStationComponents(sessionId);
             if (!built) {
                 await interaction.update({
                     content: '❌ Failed to build station list.',
@@ -1650,7 +2005,7 @@ client.on('interactionCreate', async interaction => {
 				queue.loop = !queue.loop;
 				const prefs = getUserPreferences(interaction.user.id);
 				prefs.loop = queue.loop;
-				saveUserPreferences();
+				await saveUserPreferences();
 				await interaction.reply({ content: `🔁 Loop: **${queue.loop ? 'ON' : 'OFF'}** (Preference saved)`, flags: MessageFlags.Ephemeral });
 				return;
 			}
@@ -1662,7 +2017,7 @@ client.on('interactionCreate', async interaction => {
 					queue.shuffle();
 					const prefs = getUserPreferences(interaction.user.id);
 					prefs.shuffle = true;
-					saveUserPreferences();
+					await saveUserPreferences();
 					await interaction.reply({ content: '🔀 Queue shuffled! (Preference saved)', flags: MessageFlags.Ephemeral });
 				}
 				return;
@@ -1915,7 +2270,7 @@ client.on('interactionCreate', async interaction => {
         queue.loop = !queue.loop;
         const prefs = getUserPreferences(interaction.user.id);
         prefs.loop = queue.loop;
-        saveUserPreferences();
+        await saveUserPreferences();
         await interaction.reply(`🔁 Loop: **${queue.loop ? 'ON' : 'OFF'}** (Preference saved)`);
     }
 
@@ -1928,7 +2283,7 @@ client.on('interactionCreate', async interaction => {
         // Persist user preference that they prefer shuffled playback
         const prefs = getUserPreferences(interaction.user.id);
         prefs.shuffle = true;
-        saveUserPreferences();
+        await saveUserPreferences();
         await interaction.reply('🔀 Queue shuffled! (Preference saved)');
     }
 
@@ -1942,7 +2297,7 @@ client.on('interactionCreate', async interaction => {
         const prefs = getUserPreferences(interaction.user.id);
         prefs.volume = level / 100;
         prefs.volumePercent = level;
-        saveUserPreferences();
+        await saveUserPreferences();
         await interaction.reply(`🔊 Volume set to **${level}%** (Preference saved)`);
     }
 
@@ -2002,7 +2357,7 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        saveUserPreferences();
+        await saveUserPreferences();
 
         if (clearedPlaylists === 0 && clearedRadios === 0) {
             return interaction.reply({
@@ -2143,7 +2498,7 @@ client.on('interactionCreate', async interaction => {
             }
 
             if (changed) {
-                saveUserPreferences();
+                await saveUserPreferences();
             }
 
             const effectiveShuffle = typeof prefs.shuffle === 'boolean' ? (prefs.shuffle ? 'ON' : 'OFF') : 'Not set';
