@@ -1,12 +1,12 @@
 const { Client, GatewayIntentBits, REST, Routes, EmbedBuilder, SlashCommandBuilder, StringSelectMenuBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, Events, MessageFlags } = require('discord.js');
 const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, StreamType, VoiceConnectionStatus } = require('@discordjs/voice');
-const { spawn, exec } = require('child_process');
+const { spawn, execFile } = require('child_process');
 const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const SpotifyWebApi = require('spotify-web-api-node');
 
-const execPromise = promisify(exec);
+const execFilePromise = promisify(execFile);
 
 // Resolve config path relative to this file so systemd/cwd do not matter
 const configPath = path.join(__dirname, 'config.json');
@@ -23,7 +23,7 @@ const RAW_YTDLP_ARGS = Array.isArray(config.ytdlp_args)
     ? config.ytdlp_args
     : (config.ytdlp_cookies ? ['--cookies', config.ytdlp_cookies] : []);
 
-const YTDLP_ARGS = ['--no-config', ...RAW_YTDLP_ARGS];
+const YTDLP_ARGS = ['--no-config', ...RAW_YTDLP_ARGS.map((arg, index) => sanitizeProcessArgument(arg, `config.ytdlp_args[${index}]`))];
 
 // Optional explicit format for playback; if omitted, yt-dlp chooses the best.
 // Example: "best", "bestaudio", or a more complex selector.
@@ -34,6 +34,112 @@ const YTDLP_PLAY_FORMAT = typeof config.ytdlp_format === 'string' && config.ytdl
 function getPositiveIntegerConfig(value, fallback) {
     const parsed = Number(value);
     return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function sanitizeProcessArgument(value, fieldName, options = {}) {
+    const {
+        maxLength = 4096,
+        trim = false,
+        collapseWhitespace = false,
+        allowLeadingDash = true
+    } = options;
+
+    if (value === null || value === undefined) {
+        throw new Error(`${fieldName} is required.`);
+    }
+
+    if (typeof value !== 'string') {
+        value = String(value);
+    }
+
+    if (/[\u0000-\u001F\u007F]/.test(value)) {
+        throw new Error(`${fieldName} contains control characters.`);
+    }
+
+    let sanitized = value;
+    if (collapseWhitespace) {
+        sanitized = sanitized.replace(/\s+/g, ' ');
+    }
+    if (trim) {
+        sanitized = sanitized.trim();
+    }
+
+    if (!sanitized) {
+        throw new Error(`${fieldName} cannot be empty.`);
+    }
+
+    if (sanitized.length > maxLength) {
+        throw new Error(`${fieldName} is too long.`);
+    }
+
+    if (!allowLeadingDash && sanitized.startsWith('-')) {
+        throw new Error(`${fieldName} cannot start with "-".`);
+    }
+
+    return sanitized;
+}
+
+function sanitizeSearchQuery(query) {
+    return sanitizeProcessArgument(query, 'Search query', {
+        maxLength: MAX_USER_QUERY_LENGTH,
+        trim: true,
+        collapseWhitespace: true,
+        allowLeadingDash: true
+    });
+}
+
+function sanitizeUserQuery(query) {
+    return sanitizeProcessArgument(query, 'Query', {
+        maxLength: Math.max(MAX_USER_QUERY_LENGTH, MAX_EXTERNAL_URL_LENGTH),
+        trim: true,
+        collapseWhitespace: true,
+        allowLeadingDash: true
+    });
+}
+
+function hostnameMatches(hostname, allowedHosts) {
+    const normalizedHost = String(hostname || '').toLowerCase();
+    return allowedHosts.some((allowedHost) => (
+        normalizedHost === allowedHost || normalizedHost.endsWith(`.${allowedHost}`)
+    ));
+}
+
+function sanitizeHttpUrl(value, fieldName, allowedHosts = null) {
+    const sanitized = sanitizeProcessArgument(value, fieldName, {
+        maxLength: MAX_EXTERNAL_URL_LENGTH,
+        trim: true,
+        collapseWhitespace: false,
+        allowLeadingDash: false
+    });
+
+    if (/\s/.test(sanitized)) {
+        throw new Error(`${fieldName} cannot contain whitespace.`);
+    }
+
+    let parsed;
+    try {
+        parsed = new URL(sanitized);
+    } catch {
+        throw new Error(`${fieldName} must be a valid URL.`);
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error(`${fieldName} must use http or https.`);
+    }
+
+    if (allowedHosts && !hostnameMatches(parsed.hostname, allowedHosts)) {
+        throw new Error(`${fieldName} must point to an allowed host.`);
+    }
+
+    return parsed.toString();
+}
+
+function sanitizeYouTubeUrl(value) {
+    return sanitizeHttpUrl(value, 'YouTube URL', ALLOWED_YOUTUBE_HOSTS);
+}
+
+function sanitizeRadioStreamUrl(value) {
+    return sanitizeHttpUrl(value, 'Radio stream URL');
 }
 
 // Per-user preference storage (simple JSON file on disk)
@@ -100,6 +206,17 @@ const LOOKUP_CACHE_TTL_MS = getPositiveIntegerConfig(config.lookup_cache_ttl_ms,
 const RADIO_STATION_CACHE_TTL_MS = getPositiveIntegerConfig(config.radio_station_cache_ttl_ms, 5 * 60 * 1000);
 const RADIO_SESSION_TTL_MS = getPositiveIntegerConfig(config.radio_session_ttl_ms, 15 * 60 * 1000);
 const MAX_LOOKUP_CACHE_ENTRIES = getPositiveIntegerConfig(config.lookup_cache_max_entries, 250);
+const MAX_USER_QUERY_LENGTH = getPositiveIntegerConfig(config.max_user_query_length, 300);
+const MAX_EXTERNAL_URL_LENGTH = getPositiveIntegerConfig(config.max_external_url_length, 2048);
+const YTDLP_LOOKUP_TIMEOUT_MS = getPositiveIntegerConfig(config.ytdlp_lookup_timeout_ms, 15000);
+const YTDLP_LOOKUP_MAX_BUFFER = getPositiveIntegerConfig(config.ytdlp_lookup_max_buffer, 8 * 1024 * 1024);
+const ALLOWED_YOUTUBE_HOSTS = [
+    'youtube.com',
+    'www.youtube.com',
+    'm.youtube.com',
+    'music.youtube.com',
+    'youtu.be'
+];
 
 let spotifyTokenRefreshPromise = null;
 
@@ -193,18 +310,21 @@ function getOrCreateInFlight(map, key, factory) {
     return promise;
 }
 
-function quoteShellArg(value) {
-    return `"${String(value).replace(/"/g, '\\"')}"`;
-}
-
-function buildYtDlpCommand(args) {
-    const allArgs = [...YTDLP_ARGS, ...args];
-    return `${quoteShellArg(YTDLP_BIN)} ${allArgs.map(quoteShellArg).join(' ')}`.trim();
-}
-
 async function runYtDlpLookupCommand(args, options = {}) {
-    const cmd = buildYtDlpCommand(args);
-    return ytDlpLookupLimiter.run(() => execPromise(cmd, options));
+    const safeArgs = Array.isArray(args)
+        ? args.map((arg, index) => sanitizeProcessArgument(arg, `yt-dlp argument ${index + 1}`))
+        : [];
+
+    return ytDlpLookupLimiter.run(() => execFilePromise(
+        YTDLP_BIN,
+        [...YTDLP_ARGS, ...safeArgs],
+        {
+            timeout: YTDLP_LOOKUP_TIMEOUT_MS,
+            killSignal: 'SIGKILL',
+            maxBuffer: YTDLP_LOOKUP_MAX_BUFFER,
+            ...options
+        }
+    ));
 }
 
 const client = new Client({
@@ -491,8 +611,9 @@ class MusicQueue {
 
             if (this.currentSong.type === 'radio') {
                 console.log('📻 Streaming radio via ffmpeg...');
+                const safeRadioUrl = sanitizeRadioStreamUrl(this.currentSong.url);
                 const ffmpeg = spawn('ffmpeg', [
-                    '-i', this.currentSong.url,
+                    '-i', safeRadioUrl,
                     '-f', 's16le',
                     '-ar', '48000',
                     '-ac', '2',
@@ -553,13 +674,17 @@ class MusicQueue {
 					}
 				}
 
+                const safePlaybackUrl = sanitizeYouTubeUrl(this.currentSong.url);
+                this.currentSong.url = safePlaybackUrl;
+
 				// Optional explicit format if configured; otherwise let yt-dlp decide.
 				const ytdlpArgs = [
 					...(YTDLP_PLAY_FORMAT ? ['-f', YTDLP_PLAY_FORMAT] : []),
 					'-o', '-',
 					'--no-warnings',
 					'--no-playlist',
-					this.currentSong.url
+                    '--',
+					safePlaybackUrl
 				];
 				const ytdlp = spawn(YTDLP_BIN, [...YTDLP_ARGS, ...ytdlpArgs]);
 
@@ -678,10 +803,11 @@ class MusicQueue {
 
 async function getSongInfo(query) {
     try {
-        console.log('🔍 Query:', query);
+        const sanitizedQuery = sanitizeUserQuery(query);
+        console.log('🔍 Query:', sanitizedQuery);
 
         // Spotify URL detection (tracks & playlists)
-        const spotifyInfo = parseSpotifyUrl(query);
+        const spotifyInfo = parseSpotifyUrl(sanitizedQuery);
         if (spotifyInfo && spotifyApi) {
             const api = await ensureSpotifyAccessToken();
             if (api) {
@@ -697,13 +823,13 @@ async function getSongInfo(query) {
         }
 
         // Radio station detection
-        if (query.match(/\.(mp3|m3u8|aac|pls)(\?.*)?$/i) || 
-            query.includes('stream.') || 
-            query.includes('ihrhls.com') || 
-            query.includes('streamguys')) {
+        if (sanitizedQuery.match(/\.(mp3|m3u8|aac|pls)(\?.*)?$/i) || 
+            sanitizedQuery.includes('stream.') || 
+            sanitizedQuery.includes('ihrhls.com') || 
+            sanitizedQuery.includes('streamguys')) {
             return {
                 title: 'Radio Stream',
-                url: query,
+                url: sanitizeRadioStreamUrl(sanitizedQuery),
                 type: 'radio'
             };
         }
@@ -900,12 +1026,14 @@ async function resolvePlaylistNameFromUrl(url) {
     // Fallback: use yt-dlp to inspect the playlist. This can be slow, so we
     // run it with a timeout to avoid hanging the whole command.
     try {
+        const safePlaylistUrl = sanitizeYouTubeUrl(url);
         const playlistArgs = [
             '--flat-playlist',
             '--dump-json',
-            url
+            '--',
+            safePlaylistUrl
         ];
-        const { stdout } = await runYtDlpLookupCommand(playlistArgs, { timeout: 15000 });
+        const { stdout } = await runYtDlpLookupCommand(playlistArgs, { timeout: YTDLP_LOOKUP_TIMEOUT_MS });
         const firstLine = stdout
             .trim()
             .split('\n')
@@ -926,14 +1054,16 @@ async function resolvePlaylistNameFromUrl(url) {
 }
 
         // Playlist detection
-        if (query.includes('playlist?list=') || query.includes('&list=')) {
+        if (sanitizedQuery.includes('playlist?list=') || sanitizedQuery.includes('&list=')) {
             console.log('📋 Detected playlist, fetching videos...');
 
             try {
+                const safePlaylistUrl = sanitizeYouTubeUrl(sanitizedQuery);
                 const playlistArgs = [
                     '--flat-playlist',
                     '--dump-json',
-                    query
+                    '--',
+                    safePlaylistUrl
                 ];
                 const { stdout } = await runYtDlpLookupCommand(playlistArgs);
                 const videos = stdout
@@ -963,17 +1093,17 @@ async function resolvePlaylistNameFromUrl(url) {
         }
 
         // Direct YouTube URL
-        if (query.includes('youtube.com/watch') || query.includes('youtu.be')) {
+        if (sanitizedQuery.includes('youtube.com/watch') || sanitizedQuery.includes('youtu.be')) {
             return {
                 title: 'YouTube Video',
-                url: query,
+                url: sanitizeYouTubeUrl(sanitizedQuery),
                 thumbnail: null,
                 type: 'youtube'
             };
         }
 
         // Search YouTube using yt-dlp
-        const ytResults = await searchYouTube(query, 1);
+        const ytResults = await searchYouTube(sanitizedQuery, 1);
         if (ytResults && ytResults.length > 0) {
             const v = ytResults[0];
             return {
@@ -995,74 +1125,49 @@ async function resolvePlaylistNameFromUrl(url) {
 
 // Use yt-dlp CLI to search YouTube using spawn (no shell) to avoid quoting issues.
 async function searchYouTube(query, maxResults = 1) {
-    const searchQuery = String(query || '').trim();
-    if (!searchQuery) {
+    let searchQuery;
+    try {
+        searchQuery = sanitizeSearchQuery(query);
+    } catch (err) {
+        console.error('Rejected unsafe YouTube search query:', err.message || err);
         return [];
     }
 
-    const cacheKey = `${maxResults}:${searchQuery.toLowerCase()}`;
+    const resultLimit = Number.isInteger(maxResults) && maxResults > 0
+        ? Math.min(maxResults, 10)
+        : 1;
+
+    const cacheKey = `${resultLimit}:${searchQuery.toLowerCase()}`;
     const cachedResults = getCachedValue(youtubeSearchCache, cacheKey);
     if (cachedResults) {
         return cachedResults.map(result => ({ ...result }));
     }
 
     const results = await getOrCreateInFlight(youtubeSearchInFlight, cacheKey, async () => {
-        const freshResults = await ytDlpLookupLimiter.run(() => new Promise((resolve) => {
-            try {
-                const args = [
-                    ...YTDLP_ARGS,
-                    '--flat-playlist',
-                    '--dump-json',
-                    `ytsearch${maxResults}:${searchQuery}`
-                ];
-
-                const ytdlp = spawn(YTDLP_BIN, args);
-                let stdout = '';
-                let stderr = '';
-
-                ytdlp.stdout.on('data', (data) => {
-                    stdout += data.toString();
-                });
-
-                ytdlp.stderr.on('data', (data) => {
-                    stderr += data.toString();
-                });
-
-                ytdlp.on('close', (code) => {
-                    if (code && code !== 0 && code !== 255) {
-                        const firstErrLine = (stderr || '').split('\n').find(l => l.trim()) || stderr;
-                        console.error('YouTube search failed (code %s): %s', code, firstErrLine || 'unknown error');
-                        resolve([]);
-                        return;
-                    }
-
-                    const lines = stdout.trim().split('\n').filter(Boolean);
-                    const parsedResults = lines.map(line => {
-                        try {
-                            const data = JSON.parse(line);
-                            return {
-                                title: data.title,
-                                url: `https://www.youtube.com/watch?v=${data.id}`,
-                                thumbnail: data.thumbnails && data.thumbnails[0] ? data.thumbnails[0].url : null,
-                                type: 'youtube'
-                            };
-                        } catch {
-                            return null;
-                        }
-                    }).filter(v => v !== null);
-
-                    resolve(parsedResults);
-                });
-
-                ytdlp.on('error', (err) => {
-                    console.error('YouTube search spawn failed:', err.message || err);
-                    resolve([]);
-                });
-            } catch (err) {
-                console.error('YouTube search failed:', err.message || err);
-                resolve([]);
-            }
-        }));
+        const freshResults = await runYtDlpLookupCommand([
+            '--flat-playlist',
+            '--dump-json',
+            `ytsearch${resultLimit}:${searchQuery}`
+        ]).then(({ stdout }) => {
+            const lines = stdout.trim().split('\n').filter(Boolean);
+            return lines.map(line => {
+                try {
+                    const data = JSON.parse(line);
+                    return {
+                        title: data.title,
+                        url: `https://www.youtube.com/watch?v=${data.id}`,
+                        thumbnail: data.thumbnails && data.thumbnails[0] ? data.thumbnails[0].url : null,
+                        type: 'youtube'
+                    };
+                } catch {
+                    return null;
+                }
+            }).filter(v => v !== null);
+        }).catch((err) => {
+            const firstErrLine = (err.stderr || '').split('\n').find(l => l.trim()) || err.message || 'unknown error';
+            console.error('YouTube search failed:', firstErrLine);
+            return [];
+        });
 
         setCachedValue(youtubeSearchCache, cacheKey, freshResults, LOOKUP_CACHE_TTL_MS);
         return freshResults;
@@ -1181,10 +1286,17 @@ async function fetchRadioStations({ tag, language, limit = 100 }) {
 
                 return data
                     .filter(s => s && (s.url_resolved || s.url))
-                    .map(s => ({
-                        name: s.name || s.stationuuid || 'Unknown Station',
-                        url: s.url_resolved || s.url
-                    }));
+                    .map((s) => {
+                        try {
+                            return {
+                                name: s.name || s.stationuuid || 'Unknown Station',
+                                url: sanitizeRadioStreamUrl(s.url_resolved || s.url)
+                            };
+                        } catch {
+                            return null;
+                        }
+                    })
+                    .filter(Boolean);
             } catch (err) {
                 console.error('Radio Browser fetch failed:', err.message);
                 return [];
