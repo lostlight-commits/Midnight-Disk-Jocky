@@ -211,8 +211,19 @@ class MusicQueue {
         const members = voiceChannel.members.filter(m => !m.user.bot);
         
         if (members.size === 0) {
-            console.log('👋 No users in voice channel, entering idle mode...');
-            this.enterIdleMode();
+            // Voice channel is empty: leave immediately and clean up the
+            // queue instead of waiting for an idle timer.
+            console.log('👋 No users in voice channel, leaving immediately...');
+            this.stop();
+            if (this.connection) {
+                try {
+                    this.connection.destroy();
+                } catch (err) {
+                    console.error('Error destroying voice connection during idle check:', err.message || err);
+                }
+                this.connection = null;
+            }
+            queues.delete(this.guildId);
         } else {
             this.clearIdleTimeout();
         }
