@@ -330,9 +330,7 @@ async function runYtDlpLookupCommand(args, options = {}) {
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildVoiceStates
     ]
 });
 
@@ -1562,7 +1560,27 @@ const rest = new REST({ version: '10' }).setToken(config.token);
         );
         console.log('✅ Slash commands registered');
     } catch (error) {
-        console.error('❌ Command registration failed:', error);
+        const isGlobalRegistrationForbidden = (
+            error &&
+            (error.code === 20012 || error.status === 403) &&
+            config.guild_id
+        );
+
+        if (!isGlobalRegistrationForbidden) {
+            console.error('❌ Command registration failed:', error);
+            return;
+        }
+
+        console.warn('⚠️ Global command registration not authorized; falling back to guild command registration.');
+        try {
+            await rest.put(
+                Routes.applicationGuildCommands(config.clientId, config.guild_id),
+                { body: commands }
+            );
+            console.log(`✅ Slash commands registered for guild ${config.guild_id}`);
+        } catch (guildError) {
+            console.error('❌ Guild command registration failed:', guildError);
+        }
     }
 })();
 
