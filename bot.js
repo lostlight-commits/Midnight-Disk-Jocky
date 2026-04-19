@@ -330,13 +330,65 @@ async function runYtDlpLookupCommand(args, options = {}) {
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.GuildVoiceStates
     ]
 });
 
 const queues = new Map();
+
+function getOrCreateQueue(guildId) {
+    let queue = queues.get(guildId);
+    if (!queue) {
+        queue = new MusicQueue(guildId);
+        queues.set(guildId, queue);
+    }
+    return queue;
+}
+
+function connectQueueToVoiceChannel(queue, interaction, voiceChannel) {
+    if (!interaction.guild || !interaction.guild.voiceAdapterCreator) {
+        throw new Error('Guild voice adapter is not available.');
+    }
+
+    const currentChannelId = queue.connection?.joinConfig?.channelId;
+    if (queue.connection && currentChannelId === voiceChannel.id) {
+        return;
+    }
+
+    if (queue.connection && currentChannelId !== voiceChannel.id) {
+        console.log(`🔁 Moving guild ${queue.guildId} from voice channel ${currentChannelId} to ${voiceChannel.id}`);
+        try {
+            queue.connection.destroy();
+        } catch (err) {
+            console.error('Failed to destroy previous voice connection:', err.message || err);
+        }
+        queue.connection = null;
+        queue.connectionListenersAttached = false;
+    }
+
+    queue.connection = joinVoiceChannel({
+        channelId: voiceChannel.id,
+        guildId: queue.guildId,
+        adapterCreator: interaction.guild.voiceAdapterCreator
+    });
+    queue.attachConnectionListeners();
+}
+
+function buildNowPlayingControlId(action, guildId) {
+    return `${action}:${guildId}`;
+}
+
+function parseNowPlayingControl(customId) {
+    const match = /^(np_(?:prev|pause|play|skip|loop|shuffle))(?::([0-9]{5,32}))?$/.exec(customId);
+    if (!match) {
+        return null;
+    }
+
+    return {
+        action: match[1],
+        guildId: match[2] || null
+    };
+}
 
 // Base URL for Radio Browser public API (use JSON API endpoint)
 const RADIO_BROWSER_BASE = 'https://de1.api.radio-browser.info/json';
@@ -798,6 +850,18 @@ class MusicQueue {
         this.player.stop();
         this.isPlaying = false;
         this.cleanup();
+    }
+
+    // Reset playback state without tearing down recurring queue resources.
+    // Useful for immediate station/track replacements in the same guild queue.
+    replaceCurrentPlayback() {
+        this.songs = [];
+        this.currentSong = null;
+        this.manualStop = true;
+        this.stopCurrentProcess();
+        this.player.stop();
+        this.isPlaying = false;
+        this.clearIdleTimeout();
     }
 
     setVolume(vol) {
@@ -1507,7 +1571,27 @@ const rest = new REST({ version: '10' }).setToken(config.token);
         );
         console.log('✅ Slash commands registered');
     } catch (error) {
-        console.error('❌ Command registration failed:', error);
+        const isGlobalRegistrationForbidden = (
+            error &&
+            (error.code === 20012 || error.status === 403) &&
+            config.guild_id
+        );
+
+        if (!isGlobalRegistrationForbidden) {
+            console.error('❌ Command registration failed:', error);
+            return;
+        }
+
+        console.warn('⚠️ Global command registration not authorized; falling back to guild command registration.');
+        try {
+            await rest.put(
+                Routes.applicationGuildCommands(config.clientId, config.guild_id),
+                { body: commands }
+            );
+            console.log(`✅ Slash commands registered for guild ${config.guild_id}`);
+        } catch (guildError) {
+            console.error('❌ Guild command registration failed:', guildError);
+        }
     }
 })();
 
@@ -1770,11 +1854,7 @@ client.on('interactionCreate', async interaction => {
                     return;
                 }
 
-                let queue = queues.get(guildId);
-                if (!queue) {
-                    queue = new MusicQueue(guildId);
-                    queues.set(guildId, queue);
-                }
+                const queue = getOrCreateQueue(guildId);
 
                 // Apply user preferences to this queue instance
                 if (typeof prefs.volume === 'number') {
@@ -1784,14 +1864,7 @@ client.on('interactionCreate', async interaction => {
                     queue.loop = prefs.loop;
                 }
 
-                if (!queue.connection) {
-                    queue.connection = joinVoiceChannel({
-                        channelId: voiceChannel.id,
-                        guildId: guildId,
-                        adapterCreator: interaction.guild.voiceAdapterCreator
-                    });
-                    queue.attachConnectionListeners();
-                }
+                connectQueueToVoiceChannel(queue, interaction, voiceChannel);
 
                 if (Array.isArray(songInfo)) {
                     await queue.addMultipleSongs(songInfo);
@@ -1839,24 +1912,11 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            let queue = queues.get(guildId);
-            if (!queue) {
-                queue = new MusicQueue(guildId);
-                queues.set(guildId, queue);
-            }
-
-            if (!queue.connection) {
-                queue.connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: guildId,
-                    adapterCreator: interaction.guild.voiceAdapterCreator
-                });
-                queue.attachConnectionListeners();
-            }
+            const queue = getOrCreateQueue(guildId);
+            connectQueueToVoiceChannel(queue, interaction, voiceChannel);
 
             // Instant swap to selected favorite radio station
-            queue.stop();
-            queue.songs = [];
+            queue.replaceCurrentPlayback();
 
             await queue.addSong({
                 title: entry && entry.name ? entry.name : 'Radio Station',
@@ -1896,24 +1956,11 @@ client.on('interactionCreate', async interaction => {
                 return;
             }
 
-            let queue = queues.get(guildId);
-            if (!queue) {
-                queue = new MusicQueue(guildId);
-                queues.set(guildId, queue);
-            }
-
-            if (!queue.connection) {
-                queue.connection = joinVoiceChannel({
-                    channelId: voiceChannel.id,
-                    guildId: guildId,
-                    adapterCreator: interaction.guild.voiceAdapterCreator
-                });
-                queue.attachConnectionListeners();
-            }
+            const queue = getOrCreateQueue(guildId);
+            connectQueueToVoiceChannel(queue, interaction, voiceChannel);
 
             // INSTANT SWAP - Clear queue and play new station immediately
-            queue.stop();
-            queue.songs = [];
+            queue.replaceCurrentPlayback();
             
             await queue.addSong({
                 title: station.name,
@@ -1977,20 +2024,26 @@ client.on('interactionCreate', async interaction => {
         }
 
 		// Playback control buttons from the /nowplaying embed
-		if (interaction.customId.startsWith('np_')) {
+		const nowPlayingControl = parseNowPlayingControl(interaction.customId);
+		if (nowPlayingControl) {
+            if (nowPlayingControl.guildId && nowPlayingControl.guildId !== guildId) {
+                await interaction.reply({ content: '❌ Those controls belong to a different server.', flags: MessageFlags.Ephemeral });
+                return;
+            }
+
 			const queue = queues.get(guildId);
 			if (!queue || !queue.currentSong) {
 				await interaction.reply({ content: '❌ Nothing is playing!', flags: MessageFlags.Ephemeral });
 				return;
 			}
 
-			if (interaction.customId === 'np_skip') {
+			if (nowPlayingControl.action === 'np_skip') {
 				queue.skip();
 				await interaction.reply({ content: '⏭️ Skipped!', flags: MessageFlags.Ephemeral });
 				return;
 			}
 
-			if (interaction.customId === 'np_prev') {
+			if (nowPlayingControl.action === 'np_prev') {
 				const ok = await queue.playPrevious();
 				if (!ok) {
 					await interaction.reply({ content: '❌ No previous track to play.', flags: MessageFlags.Ephemeral });
@@ -2000,19 +2053,19 @@ client.on('interactionCreate', async interaction => {
 				return;
 			}
 
-			if (interaction.customId === 'np_pause') {
+			if (nowPlayingControl.action === 'np_pause') {
 				queue.pause();
 				await interaction.reply({ content: '⏸️ Paused!', flags: MessageFlags.Ephemeral });
 				return;
 			}
 
-			if (interaction.customId === 'np_play') {
+			if (nowPlayingControl.action === 'np_play') {
 				queue.resume();
 				await interaction.reply({ content: '▶️ Resumed!', flags: MessageFlags.Ephemeral });
 				return;
 			}
 
-			if (interaction.customId === 'np_loop') {
+			if (nowPlayingControl.action === 'np_loop') {
 				queue.loop = !queue.loop;
 				const prefs = getUserPreferences(interaction.user.id);
 				prefs.loop = queue.loop;
@@ -2021,7 +2074,7 @@ client.on('interactionCreate', async interaction => {
 				return;
 			}
 
-			if (interaction.customId === 'np_shuffle') {
+			if (nowPlayingControl.action === 'np_shuffle') {
 				if (!queue.songs || queue.songs.length === 0) {
 					await interaction.reply({ content: '❌ Queue is empty!', flags: MessageFlags.Ephemeral });
 				} else {
@@ -2095,11 +2148,7 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply('❌ Could not find that song!');
         }
 
-        let queue = queues.get(guildId);
-        if (!queue) {
-            queue = new MusicQueue(guildId);
-            queues.set(guildId, queue);
-        }
+        const queue = getOrCreateQueue(guildId);
 
         // Apply user preferences to this queue instance
         const prefs = getUserPreferences(interaction.user.id);
@@ -2112,14 +2161,7 @@ client.on('interactionCreate', async interaction => {
             }
         }
 
-        if (!queue.connection) {
-            queue.connection = joinVoiceChannel({
-                channelId: voiceChannel.id,
-                guildId: guildId,
-                adapterCreator: interaction.guild.voiceAdapterCreator
-            });
-            queue.attachConnectionListeners();
-        }
+        connectQueueToVoiceChannel(queue, interaction, voiceChannel);
 
         if (Array.isArray(songInfo)) {
             await queue.addMultipleSongs(songInfo);
@@ -2242,30 +2284,30 @@ client.on('interactionCreate', async interaction => {
 		// directly from the nowplaying message.
 		const controlsRow1 = new ActionRowBuilder().addComponents(
 			new ButtonBuilder()
-				.setCustomId('np_prev')
+				.setCustomId(buildNowPlayingControlId('np_prev', guildId))
 				.setLabel('Previous')
 				.setStyle(ButtonStyle.Secondary),
 			new ButtonBuilder()
-				.setCustomId('np_pause')
+				.setCustomId(buildNowPlayingControlId('np_pause', guildId))
 				.setLabel('Pause')
 				.setStyle(ButtonStyle.Secondary),
 			new ButtonBuilder()
-				.setCustomId('np_play')
+				.setCustomId(buildNowPlayingControlId('np_play', guildId))
 				.setLabel('Play')
 				.setStyle(ButtonStyle.Secondary),
 			new ButtonBuilder()
-				.setCustomId('np_skip')
+				.setCustomId(buildNowPlayingControlId('np_skip', guildId))
 				.setLabel('Skip')
 				.setStyle(ButtonStyle.Primary)
 		);
 
 		const controlsRow2 = new ActionRowBuilder().addComponents(
 			new ButtonBuilder()
-				.setCustomId('np_loop')
+				.setCustomId(buildNowPlayingControlId('np_loop', guildId))
 				.setLabel('Loop')
 				.setStyle(ButtonStyle.Secondary),
 			new ButtonBuilder()
-				.setCustomId('np_shuffle')
+				.setCustomId(buildNowPlayingControlId('np_shuffle', guildId))
 				.setLabel('Shuffle')
 				.setStyle(ButtonStyle.Secondary)
 		);
